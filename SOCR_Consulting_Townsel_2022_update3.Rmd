@@ -1,0 +1,1291 @@
+---
+title: "SOCR-Collaboration: Exploratory Data Analytics (EDA) - OBGYN Birth and Substance Use Project"
+author: "Courtney Townsel, Mingyi Tang, Yang Chen, Ivo D. Dinov"
+date: "`r format(Sys.time(), '%D %B %Y')`"
+output:
+  html_document:
+    theme: spacelab
+    highlight: tango
+    toc: true
+    number_sections: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Background
+
+The study includes patients presenting to the Partnering for the Future (PFF) clinic over the past 4-5 years. This clinic cares for pregnant and postpartum women with a substance use disorder or mood disorder. We are interested in maternal and neonatal outcomes of the patients. the key clinical interests include:
+
+-   Maternal -- breastfeeding rates, contraception choices -what factors impact these choices (age, number of times pregnant, insurance status, number of visits, gestational age at delivery, etc)
+-   Neonatal outcomes- the major outcomes is gestational age and birth weight for the cohort
+-   how does substance exposure impact these outcomes?
+-   Among babies of our mothers with opioid use disorder (on methadone or buprenorphine or in abstinence program) how many experience NOWS (neonatal opioid withdrawal syndrome)
+
+-Another interest is in the opioid use disorder population (on medication or in abstinence) and understanding care outcomes for this group. - Are there placental findings that are associated with substance exposures or neonatal outcomes?
+
+# Approach
+
+-   Exploratory Data Analytics
+-   Confirmatory Analytics (hypotheses driven, later)
+
+# Setup
+
+The following `R` libraries are employed in this study.
+
+```{r warning=F, message=F, error=F, results='hide'}
+library(dplyr)
+library(ggplot2)
+library(missForest)
+library(plotly)
+library(randomForest)
+library(Rtsne)
+library(tidyverse)
+library(umap)
+```
+
+```{r echo = F, warning=F, message=F, error=F}
+set.seed(455)
+```
+
+## Data Import & Descriptive Statistics
+
+Import the data and generate a list of tables containing the categorical and continuous variable summaries.
+
+```{r warning=F, message=F, error=F}
+setwd("C:/Users/dinov/Desktop/Ivo.dir/Research/UMichigan/Collaborations/2022/OBGYN_Versha_Pleasant_Townsel_2022/OBGYN_2022_Townsel/")
+data = read.table("processed_data.csv", 
+                  header=TRUE, 
+                  sep=",", 
+                  stringsAsFactors=TRUE,
+                  na.strings=NA)
+
+Hmisc::describe(data) # List of tables, categorical and continuous variable summaries
+```
+
+## Data Imputation
+
+```{r data process, cache=TRUE, message=FALSE, warning=FALSE, results='hide'}
+data[data == ""] = NA
+factor.list = unname(which(sapply(data, class) == "factor"))
+col.to.delete = c()
+for (i in factor.list) {
+  if (length(levels(data[, i])) > 53) {
+    col.to.delete = c(col.to.delete, i)
+  }
+}
+data = data[, -col.to.delete]
+data = missForest(data, verbose=TRUE)$ximp
+
+data_opioid <- subset(data, Reason.for.PFF.Clinic. %in% c("opioid abstinence program", "opioid replacement therapy"))
+str(data_opioid)   # 127 obs. of  210 variables
+```
+
+<!-- ## Descriptive statistics -->
+
+<!-- ```{r warning=F, message=F, error=F, results='hide'} -->
+<!-- library(DT) -->
+<!-- round_df <- function(x, digits) { -->
+<!--     # round all numeric variables -->
+<!--     # x: data frame -->
+<!--     # digits: number of digits to round -->
+
+<!--     # numeric_columns <- sapply(x, mode) == 'numeric' -->
+<!--     # numeric_columns <- select_if(x, is.numeric) -->
+<!--     # x[numeric_columns] <-  round(x[numeric_columns], digits) -->
+<!--     x[,unlist(lapply(data, is.numeric))] <-  round(x[,unlist(lapply(data, is.numeric))], digits) -->
+<!--     x -->
+<!-- } -->
+
+<!-- Hmisc::describe(round_df(data, 3)) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- datatable(round_df(data, 3), caption="Overall Study Descriptive Statistics") -->
+<!-- ``` -->
+
+## Function Definitions
+
+Define a distribution modeling function and a variable importance plot function.
+
+```{r warning=F, message=F, error=F, fig.height=10, fig.width=10}
+# ImportantVarNames <- array()
+importance.plot = function(rf, title) {
+  importance.plot = as.data.frame(varImpPlot(rf))
+  dev.off()
+  importance.plot = importance.plot[sort(importance.plot[, 1], 
+                                         decreasing=TRUE, 
+                                         index.return=TRUE)$ix, ]
+  col.names = rownames(importance.plot)
+  # ImportantVarNames <- col.names
+  importance.plot = cbind(col.names, importance.plot)
+  rownames(importance.plot) = 1:nrow(importance.plot)
+  colnames(importance.plot)[2] = "MSE"
+  plot = ggplot(importance.plot[1:15, ]) +
+    geom_point(mapping=aes(x=reorder(col.names, -MSE), y=MSE, group=1))  +
+    labs(y="Mean Decrease Accuracy", x="Features") +
+    ggtitle(title) + 
+    scale_x_discrete(labels=function(x) str_wrap(gsub("[.]", " ", x), width=30)) + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+          plot.title = element_text(hjust = 0.5))
+  return(ggplotly(plot))
+}
+```
+
+```{r warning=F, message=F, error=F}
+# density.distribution = function(feature, data, title, x_title) {
+#   if (!is.numeric(feature)) {
+#     feature = as.character(feature)
+#     feature[feature == "checked" | feature == "yes"] = 1
+#     feature[feature == "unchecked" | feature == "no"] = 0
+#     feature = as.numeric(feature)
+#   }
+#   feature.no = density(feature[data == "no" | data == "unchecked"])
+#   feature.yes = density(feature[data == "yes" | data == "checked"])
+#   feature = plot_ly(x=~feature.no$x,
+#                     y=~feature.no$y,
+#                     type="scatter",
+#                     mode="lines",
+#                     name=paste0(x_title, "--No"),
+#                     fill="tozeroy") %>%
+#     add_trace(x=~feature.yes$x,
+#               y=~feature.yes$y,
+#               name=paste0(x_title, "--Yes"),
+#               fill="tozeroy") %>%
+#     layout(title=title,
+#            xaxis=list(title=x_title),
+#            yaxis=list(title="Density"))
+#   return(feature)
+# }
+
+density.distribution = function(feature, data, title, x_title) {
+ feature.no = density(feature[data == "0"])
+ feature.yes = density(feature[data == "1"])
+ feature = plot_ly(x=~feature.no$x, y=~feature.no$y,
+                   type="scatter", mode="lines",
+                   name=paste0(x_title, "--No"), fill="tozeroy",
+                   text=~feature.no$y,
+                   hovertemplate = paste("<b>%{text}</b><br>",
+                                            "%{yaxis.title.text}: %{y:$,.2f}<br>",
+                                            "%{xaxis.title.text}: %{x:.2f}<br>", "<extra></extra>")
+                   ) %>%
+   add_trace(x=~feature.yes$x,
+             y=~feature.yes$y,
+             name=paste0(x_title, "--Yes"),
+             fill="tozeroy") %>%
+   layout(title=title,
+          xaxis=list(title=x_title),
+          yaxis=list(title="Density"))
+ return(feature)
+}
+```
+
+# Exploratory Analytics
+
+## Baby A Birth Weight
+
+Identify and report the top features (most salient covariates associated with birth weight). Using complete dataset!
+
+```{r error=F, fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+Baby.A.Birth.weight..g. = data$Baby.A.Birth.weight..g.
+data.weight = cbind(data[, 2:(143 - sum(col.to.delete <= 143))],
+                    Baby.A.Birth.weight..g.)
+data.weight = select(data.weight, 
+                     -c(gestational.age.at.delivery..in.weeks, 
+                        number.and.kind.of.pill.given))
+rf = randomForest(Baby.A.Birth.weight..g.~., 
+                  data=data.weight, 
+                  na.action=na.roughfix, 
+                  importance=TRUE, 
+                  proximity=TRUE)
+importance.plot(rf, "Importance Plot for Baby A Birth Weight (g)")
+```
+
+```{r, warning=F, message=F, error=F, fig.height=12, fig.width=12}
+ges.age = plot_ly(
+  data=data.weight, 
+  x=~Gestational.age.at.delivery..in.days, 
+  y=~Baby.A.Birth.weight..g., 
+  type="scatter",
+  mode="markers",
+  name="Baby A Birth Weight (g) vs Gestational age at delivery (days)",
+  #marker=list(size=~Placenta.percentile, sizemode = "area"),
+  text="Baby A Birth Weight (g) vs Gestational age at delivery (days)",
+  hovertemplate = paste("<b>%{text}</b><br>",
+                        "Baby A Birth Weight (g): %{y}<br>",
+                        "Gestational age at delivery (days): %{x}<br>",
+                        #"Gestational.age.at.delivery: %{marker.size:,}",
+                        "<extra></extra>"))
+
+placenta.weight = plot_ly(
+  data=data.weight, 
+  x=~Placenta.weight..grams., 
+  y=~Baby.A.Birth.weight..g.,
+  type="scatter",
+  mode="markers",
+  name="Baby A Birth Weight (g) vs Placenta Weight (g)",
+  #marker = list(size = ~Placenta.weight..grams., sizemode = 'area'),
+  text="Baby A Birth Weight (g) vs Placenta Weight (g)",
+  overtemplate = paste("<b>%{text}</b><br>",
+                       "Baby A Birth Weight (g): %{y}<br>",
+                       "Placenta Weight (g): %{x}<br>",
+                       #"Gestational.age.at.delivery: %{marker.size:,}",
+                       "<extra></extra>"))
+
+fetal.weight.per = plot_ly(
+  data=data.weight, 
+  x=~third.trimester.estimated.fetal.weight.percentile..EFW..,
+  y=~Baby.A.Birth.weight..g.,  
+  type="scatter",
+  mode="markers",
+  name="Baby A Birth Weight (g) vs Third Trimester Estimated Fetal Weight Percentile (EFW)",
+  #marker=list(size=~Gestational.age.at.delivery..in.days, sizemode = 'area'),
+  text="Baby A Birth Weight (g) vs Third Trimester Estimated Fetal Weight Percentile (EFW)",
+  hovertemplate = paste(
+    "<b>%{text}</b><br>",
+    "Baby A Birth Weight (g): %{y}<br>",
+    "Third Trimester Estimated Fetal Weight Percentile (EFW): %{x}<br>",
+    #"Gestational.age.at.delivery: %{marker.size:,}",
+    "<extra></extra>"))
+
+placenta.per = plot_ly(
+  data=data.weight, 
+  x=~Placenta.percentile, 
+  y=~Baby.A.Birth.weight..g.,
+  type="scatter",
+  mode="markers", 
+  name="Baby A Birth Weight (g) vs Placenta Percentile", 
+  #marker = list(size = ~Gestational.age.at.delivery..in.days, sizemode = 'area'),
+  text="Baby A Birth Weight (g) vs Placenta Percentile",
+  hovertemplate = paste("<b>%{text}</b><br>",
+                        "Baby A Birth Weight (g): %{y}<br>",
+                        "Placenta Percentile: %{x}<br>",
+                        #"Gestational.age.at.delivery: %{marker.size:,}",
+                        "<extra></extra>"))
+
+abdominal.circ = plot_ly(
+  data=data.weight, 
+  x=~third.trimester.abdominal.circ..mm., 
+  y=~Baby.A.Birth.weight..g.,
+  type="scatter",
+  mode="markers", 
+  name="Baby A Birth Weight (g) vs Third trimester abdominal circ (mm)",
+  #marker = list(size = ~Gestational.age.at.delivery..in.days, sizemode = 'area'),
+  text="Baby A Birth Weight (g) vs Third trimester abdominal circ (mm)",
+  hovertemplate = paste("<b>%{text}</b><br>",
+                        "Baby A Birth Weight (g): %{y}<br>",
+                        "Third trimester abdominal circ (mm): %{x}<br>",
+                        #"Gestational.age.at.delivery: %{marker.size:,}",
+                        "<extra></extra>"))
+
+fetal.weight = plot_ly(
+  data=data.weight, 
+  x=~third.trimester.estimated.fetal.weight..EFW...grams.,
+  y=~Baby.A.Birth.weight..g.,
+  type="scatter", 
+  mode="markers",
+  name="Baby A Birth Weight (g) vs Third Trimester Estimated Fetal Weight (EFW)",
+  #marker = list(size = ~Gestational.age.at.delivery..in.days, sizemode = 'area'),
+  text="Baby A Birth Weight (g) vs Third Trimester Estimated Fetal Weight (EFW)",
+  hovertemplate = paste(
+    "<b>%{text}</b><br>",
+    "Baby A Birth Weight (g): %{y}<br>",
+    "Third Trimester Estimated Fetal Weight (EFW): %{x}<br>",
+    #"Gestational.age.at.delivery: %{marker.size:,}",
+    "<extra></extra>"))
+
+femur.length = plot_ly(
+  data=data.weight,
+  x=~third.trimester.femur.length..mm.,
+  y=~Baby.A.Birth.weight..g.,
+  type="scatter",
+  mode="markers",
+  name="Baby A Birth Weight (g) vs Third trimester femur length (mm)",
+  #marker = list(size = ~Gestational.age.at.delivery..in.days, sizemode = 'area'),
+  text="Baby A Birth Weight (g) vs Third trimester femur length (mm)",
+  hovertemplate = paste("<b>%{text}</b><br>",
+                        "Baby A Birth Weight (g): %{y}<br>",
+                        "Third trimester femur length (mm): %{x}<br>",
+                        #"Gestational.age.at.delivery: %{marker.size:,}",
+                        "<extra></extra>"))
+
+subplot(ges.age, 
+        placenta.weight, 
+        fetal.weight.per, 
+        placenta.per, 
+        fetal.weight, 
+        abdominal.circ, 
+        femur.length,
+        nrows=4) %>% 
+  layout(legend=list(orientation="h"), title="Bivariate Plots")
+```
+
+We choose some top features for analyzing baby's birth weight.
+
+```{r, warning=F, message=F, error=F}
+data.weight = select(
+  data.weight, 
+  c(Baby.A.Birth.weight..g.,
+    Gestational.age.at.delivery..in.days,
+    Placenta.weight..grams.,
+    third.trimester.estimated.fetal.weight.percentile..EFW..,
+    Placenta.percentile,
+    third.trimester.abdominal.circ..mm.,
+    third.trimester.estimated.fetal.weight..EFW...grams.,
+    third.trimester.femur.length..mm.))
+lm.weight = lm(Baby.A.Birth.weight..g. ~ .,
+               data=data.weight,
+               na.action=na.roughfix)
+summary(step(lm.weight, trace=0))
+```
+
+```{r warning=F, message=F, error=F}
+baseMod = lm(Baby.A.Birth.weight..g. ~ 1, 
+             data=data.weight,
+             na.action=na.roughfix)
+summary(step(baseMod,
+             scope=list(lower=formula(baseMod), upper=formula(lm.weight)), 
+             direction="forward", 
+             trace=0))
+```
+
+```{r warning=F, message=F, error=F, fig.height=10, fig.width=10}
+plot_ly(data.weight, 
+        x=~Gestational.age.at.delivery..in.days, 
+        y=~third.trimester.estimated.fetal.weight.percentile..EFW..,
+        z=~third.trimester.femur.length..mm., 
+        marker=list(color=~Baby.A.Birth.weight..g., 
+                    colorscale="Jet", 
+                    showscale=TRUE),
+        text = ~paste('Baby A Birth Weight (g):', Baby.A.Birth.weight..g.)) %>%
+  add_markers() %>%
+  layout(title="Color = Baby A Birth Weight (g)", 
+         scene=list(xaxis=list(title="Gestational age at delivery (days)"),
+                    yaxis=list(title="Third trimester EFW (%)"),
+                    zaxis=list(title="Third trimester femur length (mm)")))
+```
+
+### 2D UMAP Analyzing Baby A Birth Weight against Gestational Age at Delivery
+
+```{r, warning=F, message=F, error=F, fig.height=10, fig.width=10}
+custom.settings = umap.defaults
+custom.settings$n_neighbors = 5
+custom.settings$n_components = 3
+umap.weight = umap(data.weight[, 2:ncol(data.weight)], 
+                   umap.config=custom.settings)
+umap.weight.2d = data.frame(umap.weight$layout)
+plot_ly(umap.weight.2d, 
+        x=~X1, 
+        y=~X2, 
+        type="scatter",
+        marker=list(
+          color=data.weight$Baby.A.Birth.weight..g., 
+          colorscale="Jet", 
+          showscale=TRUE,
+          size=I((data.weight$Gestational.age.at.delivery..in.days/150)^5)),
+        name=paste0("Baby A Birth Weight (g)"),
+        #label=as.character(df_all$SpecimensTCell_LymphomaCellType),
+        hovertemplate = paste0(
+          "Baby A Birth Weight (g): ",
+          data.weight$Baby.A.Birth.weight..g.,
+          "<br> Gestational Age at Delivery (days): ",
+          data.weight$Gestational.age.at.delivery..in.days)
+        ) %>%
+  layout(title="UMAP2D: Color = Baby A Birth Weight (g); <br> Size = Gestational Age at Delivery (days)", 
+         xaxis=list(title = ""),  
+         yaxis=list(title = "")) %>% 
+  hide_legend()
+```
+
+### 3D UMAP Analyzing Baby A Birth Weight against Gestational Age at Delivery
+
+```{r warning=F, message=F, error=F, fig.height=10, fig.width=10}
+custom.settings = umap.defaults
+custom.settings$n_neighbors = 5
+custom.settings$n_components = 3
+umap.weight = umap(data.weight[, 2:ncol(data.weight)], 
+                   n_components=3,
+                   umap.config=custom.settings)
+umap.weight.3d = data.frame(umap.weight$layout)
+plot_ly(umap.weight.3d, 
+        x=~X1, 
+        y=~X2,
+        z=~X3,
+        marker=list(
+          color=data.weight$Baby.A.Birth.weight..g., 
+          colorscale="Jet", 
+          showscale=TRUE,
+          size=I((data.weight$Gestational.age.at.delivery..in.days/150)^5)),
+        name=paste0("Baby A Birth Weight (g)"),
+        #label=as.character(df_all$SpecimensTCell_LymphomaCellType),
+        hovertemplate = paste0(
+          "Baby A Birth Weight (g): ",
+          data.weight$Baby.A.Birth.weight..g.,
+          "<br> Gestational Age at Delivery (days): ",
+          data.weight$Gestational.age.at.delivery..in.days)
+        ) %>%
+  layout(title="UMAP3D: Color = Baby A Birth Weight (g); <br> Size = Gestational Age at Delivery (days)", 
+         scene=list(xaxis=list(title=""),
+                    yaxis=list(title=""),
+                    zaxis=list(title="")))%>%
+  hide_legend()
+```
+
+### Analyzing Baby A Birth Weight against Drugs Identified at Delivery
+
+```{r fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+amphetamine = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Amphetamine..Methamphetamine.,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Amphetamine Methamphetamine")
+
+any = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Any.Psychotropic.Medication..Citalopram.Celexa..Fluoxetine.Prozac..Bupropion.Wellbutrin..Gabapentin..Trazodone..,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Any Psychotropic Medication")
+
+benzodiazepine = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Benzodiazepine.,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Benzodiazepine")
+
+caffeine = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Caffeine.,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Caffeine")
+
+cannabinoid = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Cannabinoid..Tetrahydrocannabinol..Cannabis.,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Cannabinoid Tetrahydrocannabinol Cannabis")
+
+cocaine = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Cocaine..Methylecgonine.,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Cocaine (Methylecgonine)")
+
+methadone = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Methadone.EDDP.,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Methadone EDDP")
+
+nicotine = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Nicotine.Cotinine.,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Nicotine Cotinine")
+
+opiate = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Opiate.,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Opiate")
+
+other = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Other..list.below..,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Other")
+
+oxycodone = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Drugs.identified.at.delivery...checkboxes..choice.Oxycodone.,
+  "Baby A Birth Weight (g) vs Drugs Identified at Delivery",
+  "Oxycodone")
+
+subplot(
+  amphetamine,
+  any,
+  benzodiazepine,
+  caffeine,
+  cannabinoid,
+  cocaine,
+  methadone,
+  nicotine,
+  opiate,
+  other,
+  oxycodone,
+  nrows=4)  %>% 
+  layout(
+    legend=list(orientation="h"), 
+    title="Distribution of Baby A Birth Weight (g) vs Drugs Identified at Delivery")
+
+data.weight = select(
+  data, 
+  c(Baby.A.Birth.weight..g.,
+    Drugs.identified.at.delivery...checkboxes..choice.Amphetamine..Methamphetamine.,
+    Drugs.identified.at.delivery...checkboxes..choice.Any.Psychotropic.Medication..Citalopram.Celexa..Fluoxetine.Prozac..Bupropion.Wellbutrin..Gabapentin..Trazodone..,
+    Drugs.identified.at.delivery...checkboxes..choice.Benzodiazepine.,
+    Drugs.identified.at.delivery...checkboxes..choice.Caffeine.,
+    Drugs.identified.at.delivery...checkboxes..choice.Cannabinoid..Tetrahydrocannabinol..Cannabis.,
+    Drugs.identified.at.delivery...checkboxes..choice.Cocaine..Methylecgonine.,
+    Drugs.identified.at.delivery...checkboxes..choice.Methadone.EDDP.,
+    Drugs.identified.at.delivery...checkboxes..choice.Nicotine.Cotinine.,
+    Drugs.identified.at.delivery...checkboxes..choice.Opiate.,
+    Drugs.identified.at.delivery...checkboxes..choice.Other..list.below..,
+    Drugs.identified.at.delivery...checkboxes..choice.Oxycodone.))
+lm.weight = lm(Baby.A.Birth.weight..g. ~ .,
+               data=data.weight,
+               na.action=na.roughfix)
+summary(step(lm.weight, trace=0))
+baseMod = lm(Baby.A.Birth.weight..g. ~ 1, 
+             data=data.weight,
+             na.action=na.roughfix)
+summary(step(baseMod,
+             scope=list(lower=formula(baseMod), upper=formula(lm.weight)), 
+             direction="forward", 
+             trace=0))
+```
+
+```{r, warning=F, message=F, eval=F, fig.height=10, fig.width=10}
+data.weight = select(
+  data.weight,
+  c(Baby.A.Birth.weight..g.,
+    Drugs.identified.at.delivery...checkboxes..choice.Amphetamine..Methamphetamine.,
+    Drugs.identified.at.delivery...checkboxes..choice.Cannabinoid..Tetrahydrocannabinol..Cannabis.,
+    Drugs.identified.at.delivery...checkboxes..choice.Cocaine..Methylecgonine.))
+tsne.weight = Rtsne(data.weight[, 2:ncol(data.weight)], 
+                    dims=2,
+                    perplexity=7,
+                    check_duplicates=FALSE,
+                    max_iter=500)
+tsne.weight = data.frame(tsne.weight$Y)
+plot_ly(
+  tsne.weight, 
+  x=~X1, 
+  y=~X2,
+  marker=list(
+    color=data.weight$Baby.A.Birth.weight..g., 
+    colorscale="Jet", 
+    showscale=TRUE,
+    size=10),
+  type="scatter",
+  #hovertemplate=paste0(
+   # "tdap? ",
+#    data.breastfeeding$mark.the.vaccines.the.patient.has.received...choice.tdap., 
+#    "<br> # prenatal visits: ", 
+#    data.breastfeeding$number.of.prenatal.visits),
+  name="Baby A Birth Weight (g)") %>%
+  layout(
+    title="tsne2D: Color = Baby A Birth Weight (g)", 
+    xaxis=list(title=""),  
+    yaxis=list(title=""))%>%
+  hide_legend()
+```
+
+
+### Analyzing Baby A Birth Weight against Other Factors
+
+```{r fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+smoke = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$smoking.cessation.medication.prescribed.,
+  "Baby A Birth Weight (g)",
+  "Smoking Cessation Medication Prescribed")
+
+psy = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Does.the.patient.have.a.psychiatric.diagnosis.,
+  "Baby A Birth Weight (g)",
+  "Does the Patient Have a Psychiatric Diagnosis")
+
+medication = density.distribution(
+  data.weight$Baby.A.Birth.weight..g.,
+  data$Does.the.patient.take.any.psychiatric.medications.,
+  "Baby A Birth Weight (g)",
+  "Does the Patient Take any Psychiatric Medications")
+
+reason = as.character(data$Reason.for.PFF.Clinic.)
+reason.alcohol = density(
+  data.weight$Baby.A.Birth.weight..g.[reason == "alcohol use"])
+reason.pain = density(
+  data.weight$Baby.A.Birth.weight..g.[reason == "chronic pain"])
+reason.mood = density(
+  data.weight$Baby.A.Birth.weight..g.[reason == "mood disorder only"])
+reason.program = density(
+  data.weight$Baby.A.Birth.weight..g.[reason == "opioid abstinence program"])
+reason.therapy = density(
+  data.weight$Baby.A.Birth.weight..g.[reason == "opioid replacement therapy"])
+reason.other = density(
+  data.weight$Baby.A.Birth.weight..g.[reason == "other"])
+reason = plot_ly(x=~reason.alcohol$x,
+                 y=~reason.alcohol$y,
+                 type="scatter",
+                 mode="lines",
+                 name="Reason for PFF Clinic--Alcohol Use") %>%
+  add_trace(x=~reason.pain$x,
+            y=~reason.pain$y,
+            name="Reason for PFF Clinic--Chronic Pain") %>%
+  add_trace(x=~reason.mood$x,
+            y=~reason.mood$y,
+            name="Reason for PFF Clinic--Mood Disorder Only") %>%
+  add_trace(x=~reason.program$x,
+            y=~reason.program$y,
+            name="Reason for PFF Clinic--Opioid Abstinence Program") %>%
+  add_trace(x=~reason.therapy$x,
+            y=~reason.therapy$y,
+            name="Reason for PFF Clinic--Opioid Replacement Therapy") %>%
+  add_trace(x=~reason.other$x,
+            y=~reason.other$y,
+            name="Reason for PFF Clinic--Other") %>%
+  layout(title="Baby A Birth Weight (g)",
+           xaxis=list(title="Reason for PFF Clinic"),
+           yaxis=list(title="Density"))
+subplot(
+  smoke,
+  psy,
+  medication,
+  reason,
+  nrows=2
+) %>% 
+  layout(legend=list(orientation="h"), 
+         title="Distribution of Baby A Birth Weight (g)")
+data.weight = select(
+  data, 
+  c(Baby.A.Birth.weight..g.,
+    smoking.cessation.medication.prescribed.,
+    Does.the.patient.have.a.psychiatric.diagnosis.,
+    Does.the.patient.take.any.psychiatric.medications.,
+    Reason.for.PFF.Clinic.))
+lm.weight = lm(Baby.A.Birth.weight..g. ~ .,
+               data=data.weight,
+               na.action=na.roughfix)
+summary(step(lm.weight, trace=0))
+baseMod = lm(Baby.A.Birth.weight..g. ~ 1, 
+             data=data.weight,
+             na.action=na.roughfix)
+summary(step(baseMod,
+             scope=list(lower=formula(baseMod), upper=formula(lm.weight)), 
+             direction="forward", 
+             trace=0))
+```
+
+
+## Patient Breasfeeding at Discharge
+
+Identify and report the top features.
+
+### Random Forest Model of `was.the.patient.breastfeeding.at.discharge` using the Complete Dataset
+
+```{r error=F, fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+data.breastfeeding = data[, 2:(143 - sum(col.to.delete <= 143))]
+data.breastfeeding = select(data.breastfeeding, 
+                            -X.other..psych.diagnoses.)
+data.breastfeeding$was.the.patient.breastfeeding.at.discharge. = factor(data.breastfeeding$was.the.patient.breastfeeding.at.discharge.)
+rf = randomForest(was.the.patient.breastfeeding.at.discharge.~., 
+                  data=data.breastfeeding, 
+                  na.action=na.roughfix, 
+                  importance=TRUE, 
+                  proximity=TRUE)
+importance.plot(
+  rf, "Importance Plot for Was the Patient Breastfeeding at Discharge")
+```
+
+#### Density Distributions
+
+```{r, warning=F, message=F, error=F, fig.height=10, fig.width=10}
+visit = density.distribution(
+  feature=data.breastfeeding$number.of.prenatal.visits.,
+  data=data.breastfeeding$was.the.patient.breastfeeding.at.discharge.,
+  title="Distributions of Was Breastfeeding at Discharge",
+  x_title="Number of Prenatal Visits")
+
+hemoglobin = density.distribution(
+  data.breastfeeding$hemoglobin.after.delivery.,
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge.,
+  "Distributions of Was Breastfeeding at Discharge",
+  "Hemoglobin after Delivery")
+
+tdap = density.distribution(
+  data.breastfeeding$mark.the.vaccines.the.patient.has.received...choice.tdap.,
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge., 
+  "Distributions of Was Breastfeeding at Discharge", 
+  "Choice Tdap")
+
+EDDP = density.distribution(
+  data.breastfeeding$Drugs.identified.at.delivery...checkboxes..choice.Methadone.EDDP.,
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge.,
+  "Distributions of Was Breastfeeding at Discharge",
+  "Choice Methadone EDDP")
+
+cocaine = density.distribution(
+  data.breastfeeding$Drugs.identified.at.delivery...checkboxes..choice.Cocaine..Methylecgonine., 
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge., 
+  "Distributions of Was Breastfeeding at Discharge",
+  "Choice Cocaine Methylecgonine")
+
+methadone = density.distribution(
+  data.breastfeeding$dose.of.methadone.at.start.of.pregnancy..at.first.prenatal.appointment...mg.,
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge.,
+  "Distributions of Was Breastfeeding at Discharge",
+  "Dose of Methadone at Start of Pregnancy")
+
+HIV = density.distribution(
+  data.breastfeeding$mark.which.of.the.following.the.patient.has.been.diagnosed.with...choice.HIV.,
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge.,
+  "Distributions of Was Breastfeeding at Discharge",
+  "Choice HIV")
+
+year = density.distribution(
+  data.breastfeeding$Year.of.delivery,
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge.,
+  "Distributions of Was Breastfeeding at Discharge",
+  "Year of Delivery")
+
+smoke = density.distribution(
+  data.breastfeeding$Does..the.patient.currently.smoke..during.pregnancy..,
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge.,
+  "Distributions of Was Breastfeeding at Discharge",
+  "Does the Patient Currently Smoke")
+
+subplot(visit,
+        hemoglobin, 
+        tdap, 
+        EDDP, 
+        cocaine, 
+        methadone, 
+        HIV,
+        year,
+        smoke,
+        nrows=5)
+```
+
+We choose some top features for analyzing Patient Breastfeeding at Discharge.
+
+```{r, warning=F, message=F, error=F}
+data.breastfeeding = select(
+  data.breastfeeding, 
+  c(was.the.patient.breastfeeding.at.discharge.,
+    number.of.prenatal.visits.,
+    hemoglobin.after.delivery.,
+    mark.the.vaccines.the.patient.has.received...choice.tdap.,
+    Drugs.identified.at.delivery...checkboxes..choice.Methadone.EDDP.,
+    Drugs.identified.at.delivery...checkboxes..choice.Cocaine..Methylecgonine.,
+    dose.of.methadone.at.start.of.pregnancy..at.first.prenatal.appointment...mg.,
+    mark.which.of.the.following.the.patient.has.been.diagnosed.with...choice.HIV.,
+    Year.of.delivery,
+    Does..the.patient.currently.smoke..during.pregnancy..))
+
+lm.breastfeeding = glm(was.the.patient.breastfeeding.at.discharge. ~ ., 
+                       data=data.breastfeeding, 
+                       family = "binomial",
+                       na.action=na.roughfix)
+summary(step(lm.breastfeeding, trace=0))
+```
+
+```{r, warning=F, message=F, error=F}
+baseMod = glm(was.the.patient.breastfeeding.at.discharge. ~ 1, 
+              data=data.breastfeeding, 
+              family = "binomial",
+              na.action=na.roughfix)
+summary(step(baseMod,
+             scope=list(lower=formula(baseMod), 
+                        upper=formula(lm.breastfeeding)), 
+             direction="forward", 
+             trace=0))
+```
+
+### Random Forest Model of `was.the.patient.breastfeeding.at.discharge` using only the opioid cases
+
+Stratifying the data based on `Reason.for.PFF.Clinic.` to only the *“opioid replacement therapy”* and *“opioid abstinence”* ($n=127$).
+
+```{r error=F, fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+data.breastfeeding = data_opioid[, 2:(143 - sum(col.to.delete <= 143))]
+data.breastfeeding = select(data.breastfeeding, 
+                            -X.other..psych.diagnoses.)
+data.breastfeeding$was.the.patient.breastfeeding.at.discharge. = factor(data.breastfeeding$was.the.patient.breastfeeding.at.discharge.)
+rf = randomForest(was.the.patient.breastfeeding.at.discharge. ~ ., 
+                  data=data.breastfeeding, 
+                  na.action=na.roughfix, 
+                  importance=TRUE, 
+                  proximity=TRUE)
+importance.plot(rf, "Importance Plot for Was the Patient Breastfeeding at Discharge (Opioid Cases Only")
+```
+
+### 2D t-SNE Analyzing Patient Breasfeeding at Discharge against TDAP & Number of Prenatal Visits
+
+```{r, warning=F, message=F, error=F, fig.height=10, fig.width=10}
+tsne.breastfeeding = Rtsne(data.breastfeeding[, 2:ncol(data.breastfeeding)], 
+                           dims=2, 
+                           perplexity=7,
+                           check_duplicates=FALSE,
+                           max_iter=500)
+tsne.breastfeeding = data.frame(tsne.breastfeeding$Y)
+plot_ly(
+  tsne.breastfeeding, 
+  x=~X1, 
+  y=~X2,
+  color=data.breastfeeding$was.the.patient.breastfeeding.at.discharge., 
+  colors=c('#BF382A', '#0C4B8E'),
+  symbol=data.breastfeeding$mark.the.vaccines.the.patient.has.received...choice.tdap.,
+  symbols=c("diamond-open","o"),
+  size=data.breastfeeding$number.of.prenatal.visits.,
+  type="scatter",
+  hovertemplate=paste0(
+    "tdap? ",
+    data.breastfeeding$mark.the.vaccines.the.patient.has.received...choice.tdap., 
+    "<br> # prenatal visits: ", 
+    data.breastfeeding$number.of.prenatal.visits),
+  name=paste0("Breatfeeding at discharge? ",
+              data.breastfeeding$was.the.patient.breastfeeding.at.discharge.)) %>%
+  layout(
+    title="tsne2D: Color = Breastfeeding at Discharge; <br>Symbol = Choice Tdap; Size = # prenatal visits", 
+    xaxis=list(title=""),  
+    yaxis=list(title=""))%>%
+  hide_colorbar() %>% 
+  hide_legend()
+```
+
+### 3D t-SNE Analyzing Patient Breasfeeding at Discharge against TDAP & Number of Prenatal Visits
+
+```{r, warning=F, message=F, error=F, fig.height=10, fig.width=10}
+tsne.breastfeeding = Rtsne(data.breastfeeding[, 2:ncol(data.breastfeeding)], 
+                           dims=3, 
+                           perplexity=7,
+                           max_iter=500)
+tsne.breastfeeding = data.frame(tsne.breastfeeding$Y)
+plot_ly(
+  tsne.breastfeeding, 
+  x=~tsne.breastfeeding[, 1], 
+  y=~tsne.breastfeeding[, 2],
+  z=~tsne.breastfeeding[, 3],
+  color=data.breastfeeding$was.the.patient.breastfeeding.at.discharge., 
+  colors=c('#BF382A', '#0C4B8E'),
+  symbol=data.breastfeeding$mark.the.vaccines.the.patient.has.received...choice.tdap.,
+  symbols=c("diamond-open","o"),
+  size=I(data.breastfeeding$number.of.prenatal.visits. * 50),
+  hovertemplate=paste0(
+    "tdap? ",
+    data.breastfeeding$mark.the.vaccines.the.patient.has.received...choice.tdap., 
+    "<br> # prenatal visits: ", 
+    data.breastfeeding$number.of.prenatal.visits),
+  name=paste0("Breatfeeding at discharge? ",
+              data.breastfeeding$was.the.patient.breastfeeding.at.discharge.)) %>%
+  layout(
+    title="tsne3D: Color = Breastfeeding at Discharge; <br>Symbol = Choice Tdap; Size = # prenatal visits", 
+    scene=list(xaxis=list(title=""),
+               yaxis=list(title=""),
+               zaxis=list(title="")))%>%
+  hide_colorbar() %>% 
+  hide_legend()
+```
+
+### Analyzing Patient Breastfeeding at Discharge against Other Factors
+
+```{r fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+methadone = density.distribution(
+  data$Was.methadone.used.,
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge.,
+  title="Distributions of Was Breastfeeding at Discharge",
+  x_title="Was Methadone Used")
+
+buprenorphine = density.distribution(
+  data$Was.Buprenorphine.used.,
+  data.breastfeeding$was.the.patient.breastfeeding.at.discharge.,
+  title="Distributions of Was Breastfeeding at Discharge",
+  x_title="Was Buprenorphine Used")
+
+breastfeeding = as.numeric(
+  as.character(
+    data.breastfeeding$was.the.patient.breastfeeding.at.discharge.) == "yes")
+reason = as.character(data$Reason.for.PFF.Clinic.)
+reason.alcohol = density(breastfeeding[reason == "alcohol use"], na.rm = T)
+reason.pain = density(breastfeeding[reason == "chronic pain"], na.rm = T)
+reason.mood = density(breastfeeding[reason == "mood disorder only"], na.rm = T)
+reason.program = density(breastfeeding[reason == "opioid abstinence program"], na.rm = T)
+reason.therapy = density(breastfeeding[reason == "opioid replacement therapy"], na.rm = T)
+reason.other = density(breastfeeding[reason == "other"], na.rm = T)
+reason = plot_ly(x=~reason.alcohol$x,
+                 y=~reason.alcohol$y,
+                 type="scatter",
+                 mode="lines",
+                 name="Reason for PFF Clinic--Alcohol Use") %>%
+  add_trace(x=~reason.pain$x,
+            y=~reason.pain$y,
+            name="Reason for PFF Clinic--Chronic Pain") %>%
+  add_trace(x=~reason.mood$x,
+            y=~reason.mood$y,
+            name="Reason for PFF Clinic--Mood Disorder Only") %>%
+  add_trace(x=~reason.program$x,
+            y=~reason.program$y,
+            name="Reason for PFF Clinic--Opioid Abstinence Program") %>%
+  add_trace(x=~reason.therapy$x,
+            y=~reason.therapy$y,
+            name="Reason for PFF Clinic--Opioid Replacement Therapy") %>%
+  add_trace(x=~reason.other$x,
+            y=~reason.other$y,
+            name="Reason for PFF Clinic--Other") %>%
+  layout(title="Distributions of Was Breastfeeding at Discharge",
+           xaxis=list(title="Reason for PFF Clinic"),
+           yaxis=list(title="Density"))
+
+subplot(
+  methadone,
+  buprenorphine,
+  reason,
+  nrows=2
+) %>% 
+  layout(legend=list(orientation="h"), 
+         title="Distributions of Was Breastfeeding at Discharge")
+data.breastfeeding = select(
+  data, 
+  c(was.the.patient.breastfeeding.at.discharge.,
+    Was.methadone.used.,
+    Was.Buprenorphine.used.,
+    Reason.for.PFF.Clinic.))
+lm.breastfeeding = glm(was.the.patient.breastfeeding.at.discharge. ~ .,
+                       data=data.breastfeeding, 
+                       family = "binomial",
+                       na.action=na.roughfix)
+#summary(lm.breastfeeding)
+summary(step(lm.breastfeeding, trace=0))
+baseMod = glm(was.the.patient.breastfeeding.at.discharge. ~ 1, 
+              data=data.breastfeeding,
+              family = "binomial",
+              na.action=na.roughfix)
+summary(step(baseMod,
+             scope=list(lower=formula(baseMod), 
+                        upper=formula(lm.breastfeeding)), 
+             direction="forward", 
+             trace=0))
+```
+
+## Contraception Choices
+
+Report the top covariates.
+
+### Random Forest Model of `Confirmed.contraceptive.choice` using the complete dataset
+
+```{r error=F, fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+data.contraception = data_opioid[, 2:(143 - sum(col.to.delete <= 143))]
+data.contraception = select(
+  data.contraception, 
+  -c(X.other..psych.diagnoses.,
+     PFF.Clinic.reason.other,
+     number.and.kind.of.pill.given,
+     Notes.on.PP.opioid.prescription...if.the.initial.prescription.was.after.discharge..anything.else.worth.mentioning.))
+data.contraception$Confirmed.contraceptive.choice = factor(data.contraception$Confirmed.contraceptive.choice)
+rf = randomForest(Confirmed.contraceptive.choice ~ ., 
+                  data=data.contraception, 
+                  na.action=na.roughfix, 
+                  importance=TRUE, 
+                  proximity=TRUE)
+importance.plot(rf, "Importance Plot for Confirmed Contraception Choice (Opioid Cases Only)")
+```
+
+```{r message=FALSE, warning=FALSE}
+data.contraception = select(
+  data.contraception, 
+  c(Confirmed.contraceptive.choice,
+    Reason.for.PFF.Clinic.,
+    gestational.age.at.delivery..in.weeks,
+    days.between.delivery.and.PP.visit,
+    postpartum.visit.date,
+    Dose.of.pills.given,
+    hemoglobin.after.delivery.,
+    number.of.prenatal.visits.,
+    IUGR.))
+```
+
+### Random Forest Model of `Confirmed.contraceptive.choice` using only the opioid cases
+
+```{r error=F, fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+data.contraception = data_opioid[, 2:(143 - sum(col.to.delete <= 143))]
+data.contraception = select(
+  data.contraception, 
+  -c(X.other..psych.diagnoses.,
+     PFF.Clinic.reason.other,
+     number.and.kind.of.pill.given,
+     Notes.on.PP.opioid.prescription...if.the.initial.prescription.was.after.discharge..anything.else.worth.mentioning.))
+data.contraception$Confirmed.contraceptive.choice = factor(data.contraception$Confirmed.contraceptive.choice)
+rf = randomForest(Confirmed.contraceptive.choice ~ ., 
+                  data=data.contraception, 
+                  na.action=na.roughfix, 
+                  importance=TRUE, 
+                  proximity=TRUE)
+importance.plot(rf, "Importance Plot for Confirmed Contraception Choice (Opioid Cases Only)")
+```
+
+```{r message=FALSE, warning=FALSE}
+data.contraception = select(
+  data.contraception, 
+  c(Confirmed.contraceptive.choice,
+    Reason.for.PFF.Clinic.,
+    gestational.age.at.delivery..in.weeks,
+    days.between.delivery.and.PP.visit,
+    postpartum.visit.date,
+    Dose.of.pills.given,
+    hemoglobin.after.delivery.,
+    number.of.prenatal.visits.,
+    IUGR.))
+```
+
+
+### 2D t-SNE Analyzing Contraception Choices against Reason for PFF Clinic & Dose of Pills Given
+
+```{r, warning=F, message=F, error=F, fig.height=10, fig.width=10}
+tsne.contraception = Rtsne(data.contraception[, 2:ncol(data.contraception)], 
+                           dims=2, 
+                           perplexity=7,
+                           check_duplicates=FALSE,
+                           max_iter=500)
+tsne.contraception = data.frame(tsne.contraception$Y)
+plot_ly(
+  tsne.contraception, 
+  x=~X1, 
+  y=~X2,
+  color=data.contraception$Confirmed.contraceptive.choice, 
+  opacity=0.7,
+  symbol=data.contraception$Reason.for.PFF.Clinic.,
+  symbols=c("circle","square", "star", "triangle-up", "diamond", "x"),
+  size=I((data.contraception$Dose.of.pills.given + 5) * 15),
+  type="scatter",
+  hovertemplate=paste0(
+    "Reason for PFF Clinic: ",
+    data.contraception$Reason.for.PFF.Clinic., 
+    "<br> Dose of pills given: ", 
+    data.contraception$Dose.of.pills.given),
+  name=paste0("contraceptive choice ",
+              data.contraception$Confirmed.contraceptive.choice)) %>%
+  layout(
+    title="tsne2D: Color = Contraceptive Choice; <br>Symbol = Reason for PFF Clinic; Size = Dose of pills given", 
+    xaxis=list(title=""),  
+    yaxis=list(title=""))%>%
+  hide_colorbar() %>% 
+  hide_legend()
+```
+
+
+### 3D t-SNE Analyzing Contraception Choices against Number of Prenatal Visits
+
+```{r warning=F, message=F, error=F, fig.height=10, fig.width=10}
+tsne.contraception = Rtsne(data.contraception[, 2:ncol(data.contraception)], 
+                           dims=3, 
+                           perplexity=7,
+                           check_duplicates=FALSE,
+                           max_iter=500)
+tsne.contraception = data.frame(tsne.contraception$Y)
+plot_ly(
+  tsne.contraception, 
+  x=~tsne.contraception[, 1], 
+  y=~tsne.contraception[, 2],
+  z=~tsne.contraception[, 3],
+  color=data.contraception$Confirmed.contraceptive.choice, 
+  # opacity=0.7,
+  #symbol=data.contraception$IUGR,
+  #symbols=c("circle-open", "diamond-open"),
+  size=I((data.contraception$number.of.prenatal.visits. + 5) * 50),
+  hovertemplate=paste0(
+    "# Prenatal Visits: ",
+    data.contraception$number.of.prenatal.visits.),
+  name=paste0("contraceptive choice ",
+              data.contraception$Confirmed.contraceptive.choice)) %>%
+  layout(
+    title="tsne3D: Color = Contraceptive Choice; Size = # Prenatal Visits", 
+    scene=list(xaxis=list(title=""),
+               yaxis=list(title=""),
+               zaxis=list(title="")))%>%
+  hide_colorbar() %>% 
+  hide_legend()
+```
+
+# Phase II Analytics (complete dataset)
+
+## Unsupervised modeling using Gradient Changes in Paired Longitudinal Observations
+
+CSV Column Names (Variables): 
+
+ - *gestational age*: DZ (`X18.20.week.ultrasound.gestational.age`) and EG (`Third.trimester.ultrasound.Gestational.Age..days.`)
+ - *head circumference*: EA (`X18.20wks.head.circumference..mm.` and EH (`third.trimester.head.circ..mm.`)
+ - *abd circ*: EB (`X18.20wks.abdominal.circ...mm.`) and EI (`third.trimester.abdominal.circ..mm.`) 
+ - *femur length*:  EC (`X18.20wks.femur.length..mm.`) and EJ (`third.trimester.femur.length..mm.`)
+ - *BPD-head*: ED (`X18.20wks.biparietal.diameter..mm.`) and EK (`third.trimester.biparietal.diameter..mm.`)
+ - *Estimated Fetal Weight*: EE (`X18.20.weeks.ultrasound.estimated.fetal.weight..EFW...grams.`) and EL (`third.trimester.estimated.fetal.weight..EFW...grams.`)
+ - *Estimated fetal weight percentile*: EF (`X18.20.weeks.ultrasound.estimated.fetal.weight.percentile..EFW..`) and EM (`third.trimester.estimated.fetal.weight.percentile..EFW..`)
+
+```{r warning=F, message=F, error=F, fig.height=10, fig.width=10}
+# Define all gradients (temporal changes)
+data$GA <- data$X18.20.week.ultrasound.gestational.age - data$Third.trimester.ultrasound.Gestational.Age..days.
+data$HC <- data$X18.20wks.head.circumference..mm. - data$third.trimester.head.circ..mm. 
+data$AC <- data$X18.20wks.abdominal.circ...mm. - data$third.trimester.abdominal.circ..mm.
+
+data$FL <- data$X18.20wks.femur.length..mm. - data$third.trimester.femur.length..mm.
+data$BPDH <- data$X18.20wks.biparietal.diameter..mm. - data$third.trimester.biparietal.diameter..mm.
+data$EFW <- data$X18.20.weeks.ultrasound.estimated.fetal.weight..EFW...grams. -
+  data$third.trimester.estimated.fetal.weight..EFW...grams.
+
+data$EFWP <- data$X18.20.weeks.ultrasound.estimated.fetal.weight.percentile..EFW.. - 
+  data$third.trimester.estimated.fetal.weight.percentile..EFW..
+
+colnames(data[, 211:217])
+
+## UMAP
+custom.settings = umap.defaults
+custom.settings$n_neighbors = 5
+custom.settings$n_components = 3
+umap.weight = umap(data[, 211:217], umap.config=custom.settings, n_components = 3)
+umap.weight.3d = data.frame(umap.weight$layout)
+umap.weight.3d$Color <- as.factor(data$Mode.of.delivery.)  # Reason.for.PFF.Clinic.
+plot_ly(umap.weight.3d, x=~X1, y=~X2, z=~X3, type="scatter3d", mode="markers", 
+        marker=list(color=~as.numeric(Color), colorscale="Jet", showscale=TRUE),
+        name=paste0("Reason.for.PFF.Clinic."),
+        #label=as.character(df_all$SpecimensTCell_LymphomaCellType),
+        hovertemplate = paste0("Reason.for.PFF.Clinic.: ", data$Reason.for.PFF.Clinic.,
+          "<br> Mode.of.delivery.: ", data$Mode.of.delivery.) ) %>%
+  layout(title="UMAP3D: Color = Reason.for.PFF.Clinic <br> Size = (const)") %>%
+        # , xaxis=list(title = ""), yaxis=list(title = ""), zaxis=list(title = ""))
+  hide_legend()
+ 
+## T-SNE
+tsne.weight = Rtsne(data[, 211:217], dims=3, perplexity=10, check_duplicates=FALSE, max_iter=500)
+tsne.weight <- as.data.frame(tsne.weight$Y)
+tsne.weight$Color <- as.factor(data$Mode.of.delivery.)  # Reason.for.PFF.Clinic.
+
+plot_ly(tsne.weight, x=~V1, y=~V2, z=~V3, type="scatter3d", mode="markers", 
+        marker=list(color=~as.numeric(Color), colorscale="Jet", showscale=TRUE),
+        name=paste0("Reason.for.PFF.Clinic."),
+        #label=as.character(df_all$SpecimensTCell_LymphomaCellType),
+        hovertemplate = paste0("Reason.for.PFF.Clinic.: ", data$Reason.for.PFF.Clinic.,
+          "<br> Mode.of.delivery.: ", data$Mode.of.delivery.,
+          "<br> Choice.Amphet_Methamphetamine: ",
+          data$Drugs.identified.at.delivery...checkboxes..choice.Amphetamine..Methamphetamine.) ) %>%
+  layout(title="3D t-SNE: Color = Reason.for.PFF.Clinic <br> Size = (const)") %>%
+        # , xaxis=list(title = ""), yaxis=list(title = ""), zaxis=list(title = ""))
+  hide_legend()
+```
+
+##	Assessment by `Reason.for.PFF.Clinic` 
+
+Use CSV “column N” (Reason.for.PFF.Clinic) (interested in “opioid replacement therapy and opioid abstinence”)
+
+```{r warning=F, message=F, error=F, fig.height=10, fig.width=10}
+## GLM
+data_short <- data[, 211:217] # These are 20-week vs. 3rd trimester differentials
+data_short$Reason.for.PFF.Clinic <- data$Reason.for.PFF.Clnic.
+
+# lm.PFF.Clinic = glm(Reason.for.PFF.Clinic. ~ number.of.prenatal.visits. + 
+#     hemoglobin.after.delivery. + mark.the.vaccines.the.patient.has.received...choice.tdap. +
+#     Drugs.identified.at.delivery...checkboxes..choice.Methadone.EDDP. +
+#     dose.of.methadone.at.start.of.pregnancy..at.first.prenatal.appointment...mg. +
+#     Does..the.patient.currently.smoke..during.pregnancy.., data=data, family = "binomial", na.action=na.roughfix)
+# lm.PFF.Clinic = glm(Reason.for.PFF.Clinic ~ ., data=data_short, family = "binomial", na.action=na.roughfix)
+# summary(lm.PFF.Clinic)
+# summary(step(lm.PFF.Clinic, trace=0))
+
+## UMAP # Reason.for.PFF.Clinic.
+plot_ly(umap.weight.3d, x=~X1, y=~X2, z=~X3, type="scatter3d", mode="markers", 
+        marker=list(color=~as.numeric(Color), colorscale="Jet", showscale=TRUE),
+        name=paste0("Reason.for.PFF.Clinic."),
+        #label=as.character(df_all$SpecimensTCell_LymphomaCellType),
+        hovertemplate = paste0("Reason.for.PFF.Clinic.: ", data$Reason.for.PFF.Clinic.,
+          "<br> Mode.of.delivery.: ", data$Mode.of.delivery.) ) %>%
+  layout(title="UMAP3D: Color = Reason.for.PFF.Clinic <br> Size = (const)") %>%
+        # , xaxis=list(title = ""), yaxis=list(title = ""), zaxis=list(title = ""))
+  hide_legend()
+ 
+## T-SNE # Reason.for.PFF.Clinic.
+plot_ly(tsne.weight, x=~V1, y=~V2, z=~V3, type="scatter3d", mode="markers", 
+        marker=list(color=~as.numeric(Color), colorscale="Jet", showscale=TRUE),
+        name=paste0("Reason.for.PFF.Clinic."),
+        #label=as.character(df_all$SpecimensTCell_LymphomaCellType),
+        hovertemplate = paste0("Reason.for.PFF.Clinic.: ", data$Reason.for.PFF.Clinic.,
+          "<br> Mode.of.delivery.: ", data$Mode.of.delivery.,
+          "<br> Choice.Amphet_Methamphetamine: ",
+          data$Drugs.identified.at.delivery...checkboxes..choice.Amphetamine..Methamphetamine.) ) %>%
+  layout(title="3D t-SNE: Color = Reason.for.PFF.Clinic <br> Size = (const)") %>%
+        # , xaxis=list(title = ""), yaxis=list(title = ""), zaxis=list(title = ""))
+  hide_legend()
+```
+
+## Assessment by severe NAS “FW” (`Was.Baby.A.diagnosed.with.severe.NAS`)
+
+Clinical expectation of less steep slope for severe NAS cases .... (column FW).
+
+```{r warning=F, message=F, error=F, fig.height=10, fig.width=10}
+## GLM
+data_short <- data[, 211:217]
+data_short$Was.Baby.A.diagnosed.with.severe.NAS <- data$Was.Baby.A.diagnosed.with.severe.NAS
+
+# lm.PFF.Clinic = glm(Reason.for.PFF.Clinic. ~ number.of.prenatal.visits. + 
+#     hemoglobin.after.delivery. + mark.the.vaccines.the.patient.has.received...choice.tdap. +
+#     Drugs.identified.at.delivery...checkboxes..choice.Methadone.EDDP. +
+#     dose.of.methadone.at.start.of.pregnancy..at.first.prenatal.appointment...mg. +
+#     Does..the.patient.currently.smoke..during.pregnancy.., data=data, family = "binomial", na.action=na.roughfix)
+lm.BabyDx_severeNAS = glm(Was.Baby.A.diagnosed.with.severe.NAS ~ ., 
+                          data=data_short, family = "binomial", na.action=na.roughfix)
+
+summary(lm.BabyDx_severeNAS)
+# summary(step(lm.PFF.Clinic, trace=0))
+```
+
+None of the 7 predictors of the clinical outcome *BabyDx_severeNAS* appear significant, some covariates have *suggestive* positive, and some negative, impacts on *slope* (change from `20 weeks` to `Third.trimester` measurements).
+
+# Phase III Analytics
+
+Explicate the group trajectories by Reason for going to Clinic (`Reason.for.PFF.Clinic`) and by `NAS`.
+
+Stratification of the difference between 20-week and Third Trimester prenatal measurements (GA, HC, AC, FL, BPDH, EFW,EFWP).
+
+```{r warning=F, message=F, error=F, fig.height=10, fig.width=10}
+# lm.PFF.Clinic = glm(Reason.for.PFF.Clinic ~ ., data=data_short, family = "binomial", na.action=na.roughfix)
+data_short$Reason.for.PFF.Clinic <- data$Reason.for.PFF.Clinic.
+str(data_short)
+data_short$Was.Baby.A.diagnosed.with.severe.NAS <- 
+  ifelse (data_short$Was.Baby.A.diagnosed.with.severe.NAS<0.5, "NAS=0", "NAS=1")
+
+# GA
+plot_ly(data_short, x=~as.factor(Reason.for.PFF.Clinic), y=~GA, 
+        color=~as.factor(Was.Baby.A.diagnosed.with.severe.NAS), type="box") %>%
+  layout(title="Ultrasound GA: 20-week - Third Trimester <br> by NAS and PFF-Clinic-Visit",
+        xaxis=list(title = "PFF-Clinic-Visit"), yaxis=list(title = "Gestation Age"))
+
+# HC
+plot_ly(data_short, x=~as.factor(Reason.for.PFF.Clinic), y=~HC, 
+        color=~as.factor(Was.Baby.A.diagnosed.with.severe.NAS), type="box") %>%
+  layout(title="Ultrasound HC: 20-week - Third Trimester <br> by NAS and PFF-Clinic-Visit",
+        xaxis=list(title = "PFF-Clinic-Visit"), yaxis=list(title = "Head Circumference"))
+
+# AC
+plot_ly(data_short, x=~as.factor(Reason.for.PFF.Clinic), y=~AC, 
+        color=~as.factor(Was.Baby.A.diagnosed.with.severe.NAS), type="box") %>%
+  layout(title="Ultrasound AC: 20-week - Third Trimester <br> by NAS and PFF-Clinic-Visit",
+        xaxis=list(title = "PFF-Clinic-Visit"), yaxis=list(title = "Abominal Circumference"))
+
+# BPDH, EFW,EFWP
+plot_ly(data_short, x=~as.factor(Reason.for.PFF.Clinic), y=~BPDH, 
+        color=~as.factor(Was.Baby.A.diagnosed.with.severe.NAS), type="box") %>%
+  layout(title="Ultrasound BPDH: 20-week - Third Trimester <br> by NAS and PFF-Clinic-Visit",
+        xaxis=list(title = "PFF-Clinic-Visit"), yaxis=list(title = "BPD Head"))
+
+# EFW
+plot_ly(data_short, x=~as.factor(Reason.for.PFF.Clinic), y=~EFW, 
+        color=~as.factor(Was.Baby.A.diagnosed.with.severe.NAS), type="box") %>%
+  layout(title="Ultrasound EFW: 20-week - Third Trimester <br> by NAS and PFF-Clinic-Visit",
+        xaxis=list(title = "PFF-Clinic-Visit"), yaxis=list(title = "Estimated Fetal Weight"))
+
+# EFWP
+plot_ly(data_short, x=~as.factor(Reason.for.PFF.Clinic), y=~EFWP, 
+        color=~as.factor(Was.Baby.A.diagnosed.with.severe.NAS), type="box") %>%
+  layout(title="Ultrasound EFWP: 20-week - Third Trimester <br> by NAS and PFF-Clinic-Visit",
+        xaxis=list(title = "PFF-Clinic-Visit"), yaxis=list(title = "Estimated fetal weight percentile"))
+```
+
+
+ - *BPD-head*: ED (`X18.20wks.biparietal.diameter..mm.`) and EK (`third.trimester.biparietal.diameter..mm.`)
+ - *Estimated Fetal Weight*: EE (`X18.20.weeks.ultrasound.estimated.fetal.weight..EFW...grams.`) and EL (`third.trimester.estimated.fetal.weight..EFW...grams.`)
+ - *Estimated fetal weight percentile*: EF (`X18.20.weeks.ultrasound.estimated.fetal.weight.percentile..EFW..`) and EM (`third.trimester.estimated.fetal.weight.percentile..EFW..`)
+
+
